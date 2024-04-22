@@ -185,17 +185,19 @@ def find_cepces_submit():
 
 def get_supported_templates(server):
     cepces_submit = find_cepces_submit()
-    if os.path.exists(cepces_submit):
-        env = os.environ
-        env['CERTMONGER_OPERATION'] = 'GET-SUPPORTED-TEMPLATES'
-        p = Popen([cepces_submit, '--server=%s' % server, '--auth=Kerberos'],
-                       env=env, stdout=PIPE, stderr=PIPE)
-        out, err = p.communicate()
-        if p.returncode != 0:
-            data = { 'Error': err.decode() }
-            log.error('Failed to fetch the list of supported templates.', data)
-        return out.strip().split()
-    return []
+    if not cepces_submit:
+        log.error('Failed to find cepces-submit')
+        return []
+
+    env = os.environ
+    env['CERTMONGER_OPERATION'] = 'GET-SUPPORTED-TEMPLATES'
+    p = Popen([cepces_submit, '--server=%s' % server, '--auth=Kerberos'],
+              env=env, stdout=PIPE, stderr=PIPE)
+    out, err = p.communicate()
+    if p.returncode != 0:
+        data = {'Error': err.decode()}
+        log.error('Failed to fetch the list of supported templates.', data)
+    return out.strip().split()
 
 
 def getca(ca, url, trust_dir):
@@ -207,18 +209,17 @@ def getca(ca, url, trust_dir):
         r = requests.get(url=url, params={'operation': 'GetCACert',
                                           'message': 'CAIdentifier'})
     except requests.exceptions.ConnectionError:
-        log.warn('Failed to establish a new connection')
+        log.warn('Could not connect to Network Device Enrollment Service.')
         r = None
     if r is None or r.content == b'' or r.headers['Content-Type'] == 'text/html':
-        log.warn('Failed to fetch the root certificate chain.')
-        log.warn('The Network Device Enrollment Service is either not' +
-                 ' installed or not configured.')
+        log.warn('Unable to fetch root certificates (requires NDES).')
         if 'cACertificate' in ca:
             log.warn('Installing the server certificate only.')
+            der_certificate = base64.b64decode(ca['cACertificate'])
             try:
-                cert = load_der_x509_certificate(ca['cACertificate'])
+                cert = load_der_x509_certificate(der_certificate)
             except TypeError:
-                cert = load_der_x509_certificate(ca['cACertificate'],
+                cert = load_der_x509_certificate(der_certificate,
                                                  default_backend())
             cert_data = cert.public_bytes(Encoding.PEM)
             with open(root_cert, 'wb') as w:
@@ -271,6 +272,9 @@ def cert_enroll(ca, ldb, trust_dir, private_dir, auth='Kerberos'):
     """Install the root certificate chain."""
     data = dict({'files': [], 'templates': []}, **ca)
     url = 'http://%s/CertSrv/mscep/mscep.dll/pkiclient.exe?' % ca['hostname']
+
+    log.info("Try to get root or server certificates")
+
     root_certs = getca(ca, url, trust_dir)
     data['files'].extend(root_certs)
     global_trust_dir = find_global_trust_dir()
@@ -280,6 +284,7 @@ def cert_enroll(ca, ldb, trust_dir, private_dir, auth='Kerberos'):
         try:
             os.symlink(src, dst)
             data['files'].append(dst)
+            log.info("Created symlink: %s -> %s" % (src, dst))
         except PermissionError:
             log.warn('Failed to symlink root certificate to the'
                      ' admin trust anchors')
@@ -292,13 +297,18 @@ def cert_enroll(ca, ldb, trust_dir, private_dir, auth='Kerberos'):
             # already exists. Ignore the FileExistsError. Preserve the
             # existing symlink in the unapply data.
             data['files'].append(dst)
+
     update = update_ca_command()
+    log.info("Running %s" % (update))
     if update is not None:
-        Popen([update]).wait()
+        ret = Popen([update]).wait()
+        if ret != 0:
+            log.error('Failed to run %s' % (update))
+
     # Setup Certificate Auto Enrollment
     getcert = which('getcert')
     cepces_submit = find_cepces_submit()
-    if getcert is not None and os.path.exists(cepces_submit):
+    if getcert is not None and cepces_submit is not None:
         p = Popen([getcert, 'add-ca', '-c', ca['name'], '-e',
                   '%s --server=%s --auth=%s' % (cepces_submit,
                   ca['hostname'], auth)],
@@ -306,8 +316,12 @@ def cert_enroll(ca, ldb, trust_dir, private_dir, auth='Kerberos'):
         out, err = p.communicate()
         log.debug(out.decode())
         if p.returncode != 0:
-            data = { 'Error': err.decode(), 'CA': ca['name'] }
-            log.error('Failed to add Certificate Authority', data)
+            if p.returncode == 2:
+                log.info('The CA [%s] already exists' % ca['name'])
+            else:
+                data = {'Error': err.decode(), 'CA': ca['name']}
+                log.error('Failed to add Certificate Authority', data)
+
         supported_templates = get_supported_templates(ca['hostname'])
         for template in supported_templates:
             attrs = fetch_template_attrs(ldb, template)
@@ -322,12 +336,18 @@ def cert_enroll(ca, ldb, trust_dir, private_dir, auth='Kerberos'):
             out, err = p.communicate()
             log.debug(out.decode())
             if p.returncode != 0:
-                data = { 'Error': err.decode(), 'Certificate': nickname }
-                log.error('Failed to request certificate', data)
+                if p.returncode == 2:
+                    log.info('The template [%s] already exists' % (nickname))
+                else:
+                    data = {'Error': err.decode(), 'Certificate': nickname}
+                    log.error('Failed to request certificate', data)
+
             data['files'].extend([keyfile, certfile])
             data['templates'].append(nickname)
         if update is not None:
-            Popen([update]).wait()
+            ret = Popen([update]).wait()
+            if ret != 0:
+                log.error('Failed to run %s' % (update))
     else:
         log.warn('certmonger and cepces must be installed for ' +
                  'certificate auto enrollment to work')
@@ -356,7 +376,8 @@ class gp_cert_auto_enroll_ext(gp_pol_ext, gp_applier):
         # If the policy has changed, unapply, then apply new policy
         old_val = self.cache_get_attribute_value(guid, attribute)
         old_data = json.loads(old_val) if old_val is not None else {}
-        templates = ['%s.%s' % (ca['name'], t.decode()) for t in get_supported_templates(ca['hostname'])]
+        templates = ['%s.%s' % (ca['name'], t.decode()) for t in get_supported_templates(ca['hostname'])] \
+            if old_val is not None else []
         new_data = { 'templates': templates, **ca }
         if changed(new_data, old_data) or self.cache_get_apply_state() == GPOSTATE.ENFORCE:
             self.unapply(guid, attribute, old_val)
